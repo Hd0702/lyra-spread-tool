@@ -14,5 +14,6 @@ class TelegramClient:
     Unfortunately, we must tell the bot which chats it can use for now.
     """
 
-    async def send_message(self, message: str, chat_id: int = -1002075187090) -> telegram.Message:
+    async def send_message(self, message: str, chat_id: int | None = None) -> telegram.Message:
+        chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
         return await self._bot.send_message(chat_id, message)
