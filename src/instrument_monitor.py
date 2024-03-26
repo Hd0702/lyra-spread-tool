@@ -1,27 +1,31 @@
 import json
 import logging
 import time
-from typing import Dict, List
+from datetime import datetime
+from typing import Dict, List, Tuple
 
 import telegram
 import websockets
 
+import utils.black76
 from lyra.constants import LYRA_WEBSOCKET_URI
 from lyra.subscription_listener import SubscriptionListener
 from telegram_client.telegram_client import TelegramClient
+
 logger = logging.getLogger(__name__)
 
 
 class InstrumentMonitor:
-    def __init__(self, instruments: List[Dict], spread_limit: float, depth: float, delta: float, telegram_client: TelegramClient = None):
+    _seconds_to_millis_multiplier = 1000
+
+    def __init__(self, instruments: List[Dict], spread_limit: float, depth: float, delta: float, telegram_client: TelegramClient):
         if not instruments:
             raise ValueError("Instruments cannot be empty")
         self._instruments = instruments
         self._spread_limit = spread_limit
-        self._depth = depth
+        # dividing by 2 since we only care about depth on one side (bid or asks). They'll both sum up to depth * 2 ideally.
+        self._depth = depth / 2
         self._delta = delta
-        if telegram_client is None:
-            telegram_client = TelegramClient()
         self._telegram_client = telegram_client
 
     async def start_monitor(self):
@@ -29,11 +33,12 @@ class InstrumentMonitor:
         listener = SubscriptionListener([instrument["instrument_name"] for instrument in self._instruments])
         try:
             await listener.create_subscription_task()
-            current_epoch_milli = int(time.time() * 1000)
-            while current_epoch_milli < self._instruments[0]["scheduled_deactivation"] * 1000:
+            current_epoch_milli = int(time.time() * self._seconds_to_millis_multiplier)
+            expiry = self._instruments[0]["option_details"]["expiry"]
+            while current_epoch_milli < expiry * self._seconds_to_millis_multiplier:
                 instruments_to_check = await self._get_instrument_names_within_delta(ws_client)
                 instruments_to_alert = await self._determine_instruments_outside_spread(ws_client, listener, instruments_to_check)
-                current_epoch_milli = int(time.time() * 1000)
+                current_epoch_milli = int(time.time() * self._seconds_to_millis_multiplier)
                 if instruments_to_alert:
                     await self._send_messages_to_telegram(instruments_to_alert)
             logger.info("Expired date has hit. Closing connections.")
@@ -41,32 +46,46 @@ class InstrumentMonitor:
             await ws_client.close()
             await listener.close()
 
-    async def _determine_instruments_outside_spread(self, ws, listener: SubscriptionListener, instrument_names: List[str]):
-        last_valid_spreads = {instrument: int(time.time() * 1000) for instrument in instrument_names}
-        instruments_to_alert = {}
-        current_epoch_milli = int(time.time() * 1000)
+    async def _determine_instruments_outside_spread(self, ws, listener: SubscriptionListener, instruments: List[Dict]) -> Dict[str, str]:
+        last_valid_spreads = {instrument["instrument_name"]: int(time.time() * self._seconds_to_millis_multiplier) for instrument in instruments}
+        last_valid_liquidity_spreads = last_valid_spreads.copy()
+        low_spread_alerts = {}
+        low_liquidity_alerts = {}
+        sixty_seconds_in_millis = 60000
+        current_epoch_milli = int(time.time() * self._seconds_to_millis_multiplier)
         five_minutes_from_now_milli = current_epoch_milli + 300000
         while current_epoch_milli < five_minutes_from_now_milli:
-            current_ticker = await self._get_ticker(ws, instrument_names[0])
-            spot_price = float(current_ticker["result"]["index_price"])
-            for instrument_name in instrument_names:
+            ticker = await self._get_ticker(ws, instruments[0]["instrument_name"])
+            for instrument in instruments:
+                instrument_name = instrument["instrument_name"]
                 subscription_message = await listener.get_message(instrument_name)
                 bids = subscription_message["params"]["data"]["bids"]
                 asks = subscription_message["params"]["data"]["asks"]
-                difference = (self._calculate_depth_price(asks) - self._calculate_depth_price(bids)) / spot_price
-                if difference >= self._spread_limit:
-                    logger.info(f"Spread is too high: {difference} for instrument {instrument_name}")
-                    if subscription_message["params"]["data"]["timestamp"] - last_valid_spreads[instrument_name] >= 60000:
-                        last_valid_spreads[instrument_name] = subscription_message["params"]["data"]["timestamp"]
-                        logger.info(f"Spread has been too high for {instrument_name} for over 60 seconds")
-                        instruments_to_alert[instrument_name] = difference
-                else:
-                    logger.debug(f"valid pass for {instrument_name}")
-                    last_valid_spreads[instrument_name] = subscription_message["params"]["data"]["timestamp"]
-                current_epoch_milli = int(time.time() * 1000)
-        return instruments_to_alert
+                asks_price, asks_volume = self._calculate_depth_price(asks)
+                bids_price, bids_volume = self._calculate_depth_price(bids)
+                iv_b76_bid = self._get_iv(instrument, ticker, current_epoch_milli, bids_price)
+                iv_b76_ask = self._get_iv(instrument, ticker, current_epoch_milli, asks_price)
+                difference = iv_b76_ask - iv_b76_bid
 
-    async def _get_instrument_names_within_delta(self, ws) -> List[str]:
+                if min(asks_volume, bids_volume) < self._depth:
+                    if subscription_message["params"]["data"]["timestamp"] - last_valid_liquidity_spreads[instrument_name] >= sixty_seconds_in_millis:
+                        logger.info(f"Instrument {instrument_name} has not had valid volume or spread for over 60 seconds")
+                        lower_volume_str = "ask" if asks_volume < bids_volume else "bid"
+                        low_liquidity_alerts[instrument_name] = f"had low {lower_volume_str} volume of {min(asks_volume, bids_volume)}"
+                else:
+                    last_valid_liquidity_spreads[instrument_name] = subscription_message["params"]["data"]["timestamp"]
+
+                if difference >= self._spread_limit:
+                    if subscription_message["params"]["data"]["timestamp"] - last_valid_spreads[instrument_name] >= sixty_seconds_in_millis:
+                        logger.info(f"Spread has been too high for {instrument_name} for over 60 seconds")
+                        low_spread_alerts[instrument_name] = f"had a spread of {difference * 100}%"
+                else:
+                    last_valid_spreads[instrument_name] = subscription_message["params"]["data"]["timestamp"]
+                current_epoch_milli = int(time.time() * self._seconds_to_millis_multiplier)
+        # I'm letting low liquidity alerts take precedence over low spread alerts, but this isn't a hard rule.
+        return {**low_spread_alerts, **low_liquidity_alerts}
+
+    async def _get_instrument_names_within_delta(self, ws) -> List[Dict]:
         instruments_within_delta = []
         for instrument in self._instruments:
             instrument_name = instrument["instrument_name"]
@@ -74,16 +93,16 @@ class InstrumentMonitor:
             instrument_delta = float(ticker["result"]["option_pricing"]["delta"])
             if 0 + self._delta <= abs(instrument_delta) <= 1 - self._delta:
                 logger.debug(f"instrument is within delta 0 or 1: {instrument_delta} for instrument {instrument_name}")
-                instruments_within_delta.append(instrument_name)
+                instruments_within_delta.append(instrument)
         return instruments_within_delta
 
-    async def _send_messages_to_telegram(self, instruments_to_alert: Dict[str, float]) -> telegram.Message:
+    async def _send_messages_to_telegram(self, instruments_to_alert: Dict[str, str]) -> telegram.Message:
         message = f"""
-        Alert! Within the last 5 minutes the following instruments had a spread greater than the limit {self._spread_limit * 100}% for at least 1 minute.
+        Alert! Within the last 5 minutes the following instruments were flagged for high spread width or low liquidity.
 
-        Here are the instruments and their spreads:
+        Here are alerting instruments and their alert message:
         """ + "\n".join(
-            [f"{instrument}: {spread * 100}%" for instrument, spread in instruments_to_alert.items()]
+           sorted([f"{instrument}: {message}" for instrument, message in instruments_to_alert.items()])
         )
         left_aligned_message = "\n".join([line.strip() for line in message.splitlines()])
         logger.debug("Sending messages to telegram")
@@ -101,21 +120,30 @@ class InstrumentMonitor:
             raise ValueError(f"Error in response {response}")
         return response
 
+    def _get_iv(self, instrument: Dict, ticker: Dict, current_epoch_milli: int, price: float) -> float:
+        frwrd_price = float(ticker["result"]["option_pricing"]["forward_price"])
+        strike_price = float(instrument["option_details"]["strike"])
+        expiry = instrument["option_details"]["expiry"]
+        datetime1 = datetime.fromtimestamp(current_epoch_milli / 1000)
+        datetime2 = datetime.fromtimestamp(expiry)
+        difference_in_years = (datetime2 - datetime1).total_seconds() / (365 * 24 * 60 * 60)
+        is_call = instrument["option_details"]["option_type"] == "C"
+        return utils.black76.iv_from_b76_price(price, strike_price, difference_in_years, frwrd_price, is_call)
+
     """
     This function assumes that the orders are already sorted by price.
     For bids, the orders are sorted in descending order by price (first index)
     For asks, the orders are sorted in ascending order by price.
     The second entry in each order is the volume of the underlying.
     """
-    def _calculate_depth_price(self, orders: List[List[str]]) -> float:
-        # first entry is the price second is the amount of ETH
-        depth_left = self._depth / 2
-        total_price = 0
+
+    def _calculate_depth_price(self, orders: List[List[str]]) -> Tuple[float, float]:
+        total_price = 0.0
+        depth_used = 0
         for order in orders:
             price, volume = float(order[0]), float(order[1])
-            if volume >= depth_left:
-                total_price += price * depth_left
-            else:
-                total_price += price * volume
-                depth_left -= volume
-        return total_price / self._depth / 2
+            depth_needed = min(self._depth - depth_used, volume)
+            total_price += price * depth_needed
+            depth_used += depth_needed
+        total_price = total_price / depth_used if depth_used > 0 else 0
+        return total_price, depth_used
