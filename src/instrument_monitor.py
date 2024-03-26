@@ -91,7 +91,7 @@ class InstrumentMonitor:
             instrument_name = instrument["instrument_name"]
             ticker = await self._get_ticker(ws, instrument_name)
             instrument_delta = float(ticker["result"]["option_pricing"]["delta"])
-            if 0 + self._delta <= abs(instrument_delta) <= 1 - self._delta:
+            if self._delta <= abs(instrument_delta) <= 1 - self._delta:
                 logger.debug(f"instrument is within delta 0 or 1: {instrument_delta} for instrument {instrument_name}")
                 instruments_within_delta.append(instrument)
         return instruments_within_delta
