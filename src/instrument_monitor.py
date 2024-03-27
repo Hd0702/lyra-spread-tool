@@ -72,14 +72,14 @@ class InstrumentMonitor:
                     if subscription_message["params"]["data"]["timestamp"] - last_valid_liquidity_spreads[instrument_name] >= sixty_seconds_in_millis:
                         logger.info(f"Instrument {instrument_name} has not had valid volume or spread for over 60 seconds")
                         lower_volume_str = "ask" if asks_volume < bids_volume else "bid"
-                        low_liquidity_alerts[instrument_name] = f"had low {lower_volume_str} liquidity of {min(asks_volume, bids_volume)}"
+                        low_liquidity_alerts[instrument_name] = f"had low {lower_volume_str} liquidity of {round(min(asks_volume, bids_volume), 2)}"
                 else:
                     last_valid_liquidity_spreads[instrument_name] = subscription_message["params"]["data"]["timestamp"]
 
                 if difference >= self._spread_limit:
                     if subscription_message["params"]["data"]["timestamp"] - last_valid_spreads[instrument_name] >= sixty_seconds_in_millis:
                         logger.info(f"Spread has been too high for {instrument_name} for over 60 seconds")
-                        low_spread_alerts[instrument_name] = f"had a spread of {difference * 100}%"
+                        low_spread_alerts[instrument_name] = f"had a spread of {round(difference * 100, 2)}%"
                 else:
                     last_valid_spreads[instrument_name] = subscription_message["params"]["data"]["timestamp"]
                 current_epoch_milli = int(time.time() * self._seconds_to_millis_multiplier)
