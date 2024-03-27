@@ -54,7 +54,6 @@ class SubscriptionListener:
                 response = json.loads(await self._ws.recv())
                 logger.debug(f"Received response {response}")
                 self._instrument_results[response["params"]["data"]["instrument_name"]] = response
-        except Exception as e:
+        finally:
             self._subscription_task.cancel()
             await self._ws.close()
-            raise e

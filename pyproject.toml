@@ -1,3 +1,34 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "lyraspreadtool"
+version = "0.1.0"
+description = ""
+authors = ["Hayden Donofrio <haydendonofrio@gmail.com>"]
+readme = "README.md"
+packages = [{include = "*", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+requests = "^2.25.1"
+numba = "^0.59.1"
+numpy = "^1.26.4"
+python-telegram-bot = "^21.0.1"
+scipy = "^1.12.0"
+websockets = "^12.0"
+
+
+[tool.poetry.scripts]
+main = "src.main:main"
+
+[tool.pytest.ini_options]
+addopts = [
+    "--import-mode=importlib",
+]
+pythonpath = "src"
+
 [tool.black]
 line-length = 200
 include = '\.pyi?$'

@@ -2,7 +2,7 @@ import json
 import logging
 import time
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import telegram
 import websockets
@@ -10,6 +10,7 @@ import websockets
 import utils.black76
 from lyra.constants import LYRA_WEBSOCKET_URI
 from lyra.subscription_listener import SubscriptionListener
+from src.utils import depth_calculator
 from telegram_client.telegram_client import TelegramClient
 
 logger = logging.getLogger(__name__)
@@ -61,17 +62,17 @@ class InstrumentMonitor:
                 subscription_message = await listener.get_message(instrument_name)
                 bids = subscription_message["params"]["data"]["bids"]
                 asks = subscription_message["params"]["data"]["asks"]
-                asks_price, asks_volume = self._calculate_depth_price(asks)
-                bids_price, bids_volume = self._calculate_depth_price(bids)
+                asks_price, asks_volume = depth_calculator.calculate_depth_price(self._depth, asks)
+                bids_price, bids_volume = depth_calculator.calculate_depth_price(self._depth, bids)
                 iv_b76_bid = self._get_iv(instrument, ticker, current_epoch_milli, bids_price)
                 iv_b76_ask = self._get_iv(instrument, ticker, current_epoch_milli, asks_price)
                 difference = iv_b76_ask - iv_b76_bid
-
+                logger.debug(f"Spread for {instrument_name} is {difference * 100}% and iv_b76_bid is {iv_b76_bid} and iv_b76_ask is {iv_b76_ask}")
                 if min(asks_volume, bids_volume) < self._depth:
                     if subscription_message["params"]["data"]["timestamp"] - last_valid_liquidity_spreads[instrument_name] >= sixty_seconds_in_millis:
                         logger.info(f"Instrument {instrument_name} has not had valid volume or spread for over 60 seconds")
                         lower_volume_str = "ask" if asks_volume < bids_volume else "bid"
-                        low_liquidity_alerts[instrument_name] = f"had low {lower_volume_str} volume of {min(asks_volume, bids_volume)}"
+                        low_liquidity_alerts[instrument_name] = f"had low {lower_volume_str} liquidity of {min(asks_volume, bids_volume)}"
                 else:
                     last_valid_liquidity_spreads[instrument_name] = subscription_message["params"]["data"]["timestamp"]
 
@@ -98,7 +99,9 @@ class InstrumentMonitor:
 
     async def _send_messages_to_telegram(self, instruments_to_alert: Dict[str, str]) -> telegram.Message:
         message = f"""
-        Alert! Within the last 5 minutes the following instruments were flagged for high spread width or low liquidity.
+        Alert! Within the last 5 minutes the following instruments were flagged for high spread width or low liquidity for an ETH depth of {self._depth * 2}.
+        Spread threshold: {round(self._spread_limit * 100, 2)}%
+        Liquidity threshold: {round(self._depth * 2, 2)} ETH
 
         Here are alerting instruments and their alert message:
         """ + "\n".join(
@@ -129,21 +132,3 @@ class InstrumentMonitor:
         difference_in_years = (datetime2 - datetime1).total_seconds() / (365 * 24 * 60 * 60)
         is_call = instrument["option_details"]["option_type"] == "C"
         return utils.black76.iv_from_b76_price(price, strike_price, difference_in_years, frwrd_price, is_call)
-
-    """
-    This function assumes that the orders are already sorted by price.
-    For bids, the orders are sorted in descending order by price (first index)
-    For asks, the orders are sorted in ascending order by price.
-    The second entry in each order is the volume of the underlying.
-    """
-
-    def _calculate_depth_price(self, orders: List[List[str]]) -> Tuple[float, float]:
-        total_price = 0.0
-        depth_used = 0
-        for order in orders:
-            price, volume = float(order[0]), float(order[1])
-            depth_needed = min(self._depth - depth_used, volume)
-            total_price += price * depth_needed
-            depth_used += depth_needed
-        total_price = total_price / depth_used if depth_used > 0 else 0
-        return total_price, depth_used
