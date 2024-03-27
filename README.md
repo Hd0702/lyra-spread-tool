@@ -14,4 +14,4 @@ The script will run until the expiry date is reached or by manual input.
 
 ## How to run
 
-I included a script file `start.sh` that will build the docker image and run the container. It currently runs on python 3.11 since that is the latest compatible version with our libraries.
+I included a script file `start.sh` that will build the docker image and run the container. It currently runs on python 3.10 Since 3.11 gives some weird compatibility errors with numpy on the docker image.
